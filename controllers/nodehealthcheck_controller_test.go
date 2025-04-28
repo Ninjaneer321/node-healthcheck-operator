@@ -210,7 +210,10 @@ var _ = Describe("Node Health Check CR", func() {
 						Expect(k8sClient.Update(context.Background(), &item)).To(Succeed())
 						Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(&item), &item)).To(Succeed())
 					}
-					Expect(k8sClient.Delete(context.Background(), &item)).To(Succeed())
+					err := k8sClient.Delete(context.Background(), &item)
+					if err != nil {
+						Expect(errors.IsNotFound(err)).To(BeTrue())
+					}
 				}
 			}
 
@@ -1288,15 +1291,15 @@ var _ = Describe("Node Health Check CR", func() {
 				Expect(k8sClient.Delete(context.Background(), node))
 			}
 
-			markCR := func() *unstructured.Unstructured {
-				By("marking CR as succeeded and permanent node deletion expected")
+			markCR := func(succeededStatus metav1.ConditionStatus) *unstructured.Unstructured {
+				By("marking CR for permanent node deletion expected")
 				cr := findRemediationCRForNHC("unhealthy-worker-node-1", underTest)
 				Expect(cr).ToNot(BeNil())
 
 				conditions := []interface{}{
 					map[string]interface{}{
 						"type":               commonconditions.SucceededType,
-						"status":             "True",
+						"status":             string(succeededStatus),
 						"lastTransitionTime": time.Now().Format(time.RFC3339),
 					},
 					map[string]interface{}{
@@ -1322,18 +1325,30 @@ var _ = Describe("Node Health Check CR", func() {
 				Expect(underTest.Status.UnhealthyNodes).To(BeEmpty())
 			}
 
-			It("it should delete orphaned CR when CR was updated", func() {
+			ensureCRNotDeleted := func(cr *unstructured.Unstructured) {
+				By("ensuring CR is not deleted")
+				Consistently(func() error {
+					return k8sClient.Get(context.Background(), client.ObjectKeyFromObject(cr), cr)
+				}, "10s", "1s").ShouldNot(HaveOccurred())
+
+				// get updated NHC
+				Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(underTest), underTest)).To(Succeed())
+				Expect(underTest.Status.UnhealthyNodes).ToNot(BeEmpty())
+			}
+
+			It("it should delete orphaned CR when CR with expected node deletion succeeded", func() {
 				Expect(underTest.Status.UnhealthyNodes).To(HaveLen(1))
+				cr := markCR(metav1.ConditionFalse)
 				deleteNode()
-				time.Sleep(1 * time.Second)
-				cr := markCR()
+				ensureCRNotDeleted(cr)
+				cr = markCR(metav1.ConditionTrue)
 				expectCRDeletion(cr)
 			})
 
 			It("it should delete orphaned CR when node is deleted", func() {
 				Expect(underTest.Status.UnhealthyNodes).To(HaveLen(1))
-				cr := markCR()
-				time.Sleep(1 * time.Second)
+				cr := findRemediationCRForNHC("unhealthy-worker-node-1", underTest)
+				Expect(cr).ToNot(BeNil())
 				deleteNode()
 				expectCRDeletion(cr)
 			})
@@ -1674,38 +1689,95 @@ var _ = Describe("Node Health Check CR", func() {
 		When("Nodes are candidates for remediation and cluster is upgrading", func() {
 			BeforeEach(func() {
 				clusterUpgradeRequeueAfter = 5 * time.Second
-				upgradeChecker.Upgrading = true
 				setupObjects(1, 2, true)
 			})
+			When("non HCP Upgrade", func() {
+				BeforeEach(func() {
+					upgradeChecker.Upgrading = true
+				})
 
-			AfterEach(func() {
-				upgradeChecker.Upgrading = false
+				AfterEach(func() {
+					upgradeChecker.Upgrading = false
+				})
+
+				It("doesn't not remediate but requeues reconciliation and updates status", func() {
+					cr := findRemediationCRForNHC(unhealthyNodeName, underTest)
+					Expect(cr).To(BeNil())
+
+					Expect(*underTest.Status.HealthyNodes).To(Equal(0))
+					Expect(*underTest.Status.ObservedNodes).To(Equal(0))
+					Expect(underTest.Status.UnhealthyNodes).To(BeEmpty())
+					Expect(underTest.Status.Phase).To(Equal(v1alpha1.PhaseEnabled))
+					Expect(underTest.Status.Reason).ToNot(BeEmpty())
+
+					By("stopping upgrade and waiting for requeue")
+					upgradeChecker.Upgrading = false
+					time.Sleep(10 * time.Second)
+					cr = findRemediationCRForNHC(unhealthyNodeName, underTest)
+					Expect(cr).ToNot(BeNil())
+
+					Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(underTest), underTest)).To(Succeed())
+					Expect(*underTest.Status.HealthyNodes).To(Equal(2))
+					Expect(*underTest.Status.ObservedNodes).To(Equal(3))
+					Expect(underTest.Status.UnhealthyNodes).To(HaveLen(1))
+				})
+
 			})
+			When("HCP Upgrade", func() {
+				var currentMachineConfigAnnotationKey = "machineconfiguration.openshift.io/currentConfig"
+				var desiredMachineConfigAnnotationKey = "machineconfiguration.openshift.io/desiredConfig"
+				BeforeEach(func() {
+					//Use a real upgrade checker instead of mock
+					prevUpgradeChecker := nhcReconciler.ClusterUpgradeStatusChecker
+					nhcReconciler.ClusterUpgradeStatusChecker = ocpUpgradeChecker
+					DeferCleanup(func() {
+						nhcReconciler.ClusterUpgradeStatusChecker = prevUpgradeChecker
+					})
 
-			It("doesn't not remediate but requeues reconciliation and updates status", func() {
-				cr := findRemediationCRForNHC(unhealthyNodeName, underTest)
-				Expect(cr).To(BeNil())
+					//Simulate HCP Upgrade on the unhealthy node
+					upgradingNode := objects[0]
+					upgradingNodeAnnotations := map[string]string{}
+					if upgradingNode.GetAnnotations() != nil {
+						upgradingNodeAnnotations = upgradingNode.GetAnnotations()
+					}
+					upgradingNodeAnnotations[currentMachineConfigAnnotationKey] = "fakeVersion1"
+					upgradingNodeAnnotations[desiredMachineConfigAnnotationKey] = "fakeVersion2"
+					upgradingNode.SetAnnotations(upgradingNodeAnnotations)
 
-				Expect(*underTest.Status.HealthyNodes).To(Equal(0))
-				Expect(*underTest.Status.ObservedNodes).To(Equal(0))
-				Expect(underTest.Status.UnhealthyNodes).To(BeEmpty())
-				Expect(underTest.Status.Phase).To(Equal(v1alpha1.PhaseEnabled))
-				Expect(underTest.Status.Reason).ToNot(BeEmpty())
+				})
 
-				By("stopping upgrade and waiting for requeue")
-				upgradeChecker.Upgrading = false
-				time.Sleep(10 * time.Second)
-				cr = findRemediationCRForNHC(unhealthyNodeName, underTest)
-				Expect(cr).ToNot(BeNil())
+				It("doesn't not remediate but requeues reconciliation and updates status", func() {
 
-				Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(underTest), underTest)).To(Succeed())
-				Expect(*underTest.Status.HealthyNodes).To(Equal(2))
-				Expect(*underTest.Status.ObservedNodes).To(Equal(3))
-				Expect(underTest.Status.UnhealthyNodes).To(HaveLen(1))
+					cr := findRemediationCRForNHC(unhealthyNodeName, underTest)
+					Expect(cr).To(BeNil())
+
+					Expect(*underTest.Status.HealthyNodes).To(Equal(0))
+					Expect(*underTest.Status.ObservedNodes).To(Equal(0))
+					Expect(underTest.Status.UnhealthyNodes).To(BeEmpty())
+					Expect(underTest.Status.Phase).To(Equal(v1alpha1.PhaseEnabled))
+					Expect(underTest.Status.Reason).ToNot(BeEmpty())
+
+					By("stopping upgrade and waiting for requeue")
+					unhealthyNode := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: unhealthyNodeName}}
+					Expect(k8sClient.Get(context.TODO(), client.ObjectKeyFromObject(unhealthyNode), unhealthyNode)).To(Succeed())
+					if unhealthyNode.GetAnnotations()[currentMachineConfigAnnotationKey] != unhealthyNode.GetAnnotations()[desiredMachineConfigAnnotationKey] {
+						// Simulating upgrade complete.
+						unhealthyNode.Annotations[currentMachineConfigAnnotationKey] = unhealthyNode.GetAnnotations()[desiredMachineConfigAnnotationKey]
+						Expect(k8sClient.Update(context.TODO(), unhealthyNode)).To(Succeed())
+					}
+
+					time.Sleep(10 * time.Second)
+					cr = findRemediationCRForNHC(unhealthyNodeName, underTest)
+					Expect(cr).ToNot(BeNil())
+
+					Expect(k8sClient.Get(context.Background(), client.ObjectKeyFromObject(underTest), underTest)).To(Succeed())
+					Expect(*underTest.Status.HealthyNodes).To(Equal(2))
+					Expect(*underTest.Status.ObservedNodes).To(Equal(3))
+					Expect(underTest.Status.UnhealthyNodes).To(HaveLen(1))
+				})
+
 			})
-
 		})
-
 		Context("Machine owners", func() {
 			When("Metal3RemediationTemplate is in correct namespace", func() {
 
@@ -2283,7 +2355,7 @@ func newRemediationCRForNHC(nodeName string, nhc *v1alpha1.NodeHealthCheck) *uns
 		Name:       nhc.Name,
 		UID:        nhc.UID,
 	}
-	return newRemediationCR(nodeName, templateRef, owner)
+	return newRemediationCR(nodeName, nodeName, templateRef, owner)
 }
 
 func newNodeHealthCheck() *v1alpha1.NodeHealthCheck {

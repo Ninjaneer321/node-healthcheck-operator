@@ -57,6 +57,7 @@ type MachineHealthCheckReconciler struct {
 	MHCChecker                     mhc.Checker
 	FeatureGateMHCControllerEvents <-chan event.GenericEvent
 	FeatureGates                   featuregates.Accessor
+	WatchManager                   resources.WatchManager
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -97,7 +98,12 @@ func (r *MachineHealthCheckReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		handler.EnqueueRequestsFromMapFunc(utils.MHCByFeatureGateEventMapperFunc(mgr.GetClient(), mgr.GetLogger(), r.FeatureGates)),
 	)
 
-	return bldr.Complete(r)
+	if controller, err := bldr.Build(r); err == nil {
+		r.WatchManager.SetController(controller)
+		return nil
+	} else {
+		return err
+	}
 }
 
 func indexMachineByNodeName(object client.Object) []string {
@@ -185,6 +191,9 @@ func (r *MachineHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	// TODO add more checks like in NHC?!
+	if err = r.WatchManager.AddWatchesMhc(resourceManager, mhc); err != nil {
+		return result, err
+	}
 
 	log.Info("Reconciling")
 
@@ -403,19 +412,21 @@ func (r *MachineHealthCheckReconciler) remediate(target resources.Target, rm res
 	if err != nil {
 		return errors.Wrapf(err, "failed to get remediation template")
 	}
-	remediationCR, err := rm.GenerateRemediationCRForMachine(target.Machine, target.MHC, template)
-	if err != nil {
-		return errors.Wrapf(err, "failed to generate remediation CR")
+
+	var nodeNamePtr *string
+	if target.Node != nil && target.Node.ResourceVersion != "" {
+		nodeNamePtr = &target.Node.Name
 	}
 
 	// TODO add control plane label
 
 	// create remediation CR
-	var nodeName *string
-	if target.Node != nil && target.Node.ResourceVersion != "" {
-		nodeName = &target.Node.Name
+	remediationCR, err := rm.GenerateRemediationCRForMachine(target.Machine, target.MHC, template, pointer.StringDeref(nodeNamePtr, ""))
+	if err != nil {
+		return errors.Wrapf(err, "failed to generate remediation CR")
 	}
-	created, _, _, err := rm.CreateRemediationCR(remediationCR, target.MHC, nodeName, utils.DefaultRemediationDuration, 0)
+
+	created, _, _, err := rm.CreateRemediationCR(remediationCR, target.MHC, nodeNamePtr, utils.DefaultRemediationDuration, 0)
 	if err != nil {
 		if _, ok := err.(resources.RemediationCRNotOwned); ok {
 			// CR exists but not owned by us, nothing to do

@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -45,7 +44,6 @@ import (
 	"k8s.io/utils/pointer"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -88,9 +86,7 @@ type NodeHealthCheckReconciler struct {
 	Capabilities                cluster.Capabilities
 	MHCEvents                   chan event.GenericEvent
 	controller                  controller.Controller
-	watches                     map[string]struct{}
-	watchesLock                 *sync.Mutex
-	cache                       cache.Cache
+	WatchManager                resources.WatchManager
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -121,10 +117,7 @@ func (r *NodeHealthCheckReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err != nil {
 		return err
 	}
-	r.controller = controller
-	r.watches = make(map[string]struct{})
-	r.watchesLock = &sync.Mutex{}
-	r.cache = mgr.GetCache()
+	r.WatchManager.SetController(controller)
 	return nil
 }
 
@@ -170,7 +163,7 @@ func (r *NodeHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	defer func() {
 		patchErr := r.patchStatus(ctx, log, nhc, nhcOrig)
 		if patchErr != nil {
-			log.Error(err, "failed to update status")
+			log.Error(patchErr, "failed to update status")
 		}
 		returnErr = utilerrors.NewAggregate([]error{patchErr, returnErr})
 		log.Info("reconcile end", "error", returnErr, "requeue", result.Requeue, "requeuAfter", result.RequeueAfter)
@@ -234,7 +227,7 @@ func (r *NodeHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// add watches for template and remediation CRs
-	if err = r.addWatches(resourceManager, nhc); err != nil {
+	if err = r.WatchManager.AddWatchesNhc(resourceManager, nhc); err != nil {
 		return result, err
 	}
 
@@ -249,7 +242,7 @@ func (r *NodeHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	updateRequeueAfter(&result, requeueAfter)
 
 	// TODO consider setting Disabled condition?
-	if r.isClusterUpgrading() {
+	if r.isClusterUpgrading(matchingNodes) {
 		msg := "Postponing potential remediations because of ongoing cluster upgrade"
 		log.Info(msg)
 		commonevents.NormalEvent(r.Recorder, nhc, utils.EventReasonRemediationSkipped, msg)
@@ -388,8 +381,8 @@ func (r *NodeHealthCheckReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	return result, nil
 }
 
-func (r *NodeHealthCheckReconciler) isClusterUpgrading() bool {
-	clusterUpgrading, err := r.ClusterUpgradeStatusChecker.Check()
+func (r *NodeHealthCheckReconciler) isClusterUpgrading(nodesToBeRemediated []v1.Node) bool {
+	clusterUpgrading, err := r.ClusterUpgradeStatusChecker.Check(nodesToBeRemediated)
 	if err != nil {
 		// if we can't reliably tell if the cluster is upgrading then just continue with remediation.
 		// TODO finer error handling may help to decide otherwise here.
@@ -465,12 +458,14 @@ func (r *NodeHealthCheckReconciler) deleteOrphanedRemediationCRs(nhc *remediatio
 		}
 
 		// check conditions
+		// for some remediators (e.g. MDR) node deletion is expected. If so, wait until they are succeeded.
+		// for all other remediators, we can delete the CRs immediately after node deletion
 		permanentNodeDeletionExpectedCondition := getCondition(&cr, commonconditions.PermanentNodeDeletionExpectedType, log)
 		permanentNodeDeletionExpected := permanentNodeDeletionExpectedCondition != nil && permanentNodeDeletionExpectedCondition.Status == metav1.ConditionTrue
 		succeededCondition := getCondition(&cr, commonconditions.SucceededType, log)
 		succeeded := succeededCondition != nil && succeededCondition.Status == metav1.ConditionTrue
-		if !permanentNodeDeletionExpected || !succeeded {
-			// no node name change expected, or not succeeded yet
+		if permanentNodeDeletionExpected && !succeeded {
+			// node deletion is expected, but remediation not succeeded yet
 			return false
 		}
 
@@ -504,13 +499,10 @@ func (r *NodeHealthCheckReconciler) deleteOrphanedRemediationCRs(nhc *remediatio
 		resources.UpdateStatusNodeHealthy(nodeName, nhc)
 
 		if deleted, err := rm.DeleteRemediationCR(&cr, nhc); err != nil {
-			log.Error(err, "failed to delete remediation CR", "name", cr.GetName())
+			log.Error(err, "failed to delete orphaned remediation CR", "name", cr.GetName())
 			return err
 		} else if deleted {
-			permanentNodeDeletionExpectedCondition := getCondition(&cr, commonconditions.PermanentNodeDeletionExpectedType, log)
-			log.Info("deleted orphaned remediation CR", "name", cr.GetName(),
-				"reason", permanentNodeDeletionExpectedCondition.Reason,
-				"message", permanentNodeDeletionExpectedCondition.Message)
+			log.Info("deleted orphaned remediation CR", "name", cr.GetName(), "for deleted node", nodeName)
 		}
 
 	}
@@ -811,91 +803,6 @@ func (r *NodeHealthCheckReconciler) alertOldRemediationCR(remediationCR *unstruc
 	}
 	return isSendAlert, nextReconcile
 
-}
-
-func (r *NodeHealthCheckReconciler) addWatches(rm resources.Manager, nhc *remediationv1alpha1.NodeHealthCheck) error {
-
-	addWatches := func(ref v1.ObjectReference) error {
-		template := rm.GenerateTemplate(&ref)
-		if err := r.addRemediationTemplateCRWatch(template); err != nil {
-			r.Log.Error(err, "failed to add watch for template CR", "kind", template.GetKind())
-			return err
-		}
-		rem := rm.GenerateRemediationCRBase(template.GroupVersionKind())
-		if err := r.addRemediationCRWatch(rem); err != nil {
-			r.Log.Error(err, "failed to add watch for remediation CR", "kind", rem.GetKind())
-			return err
-		}
-		return nil
-	}
-
-	if nhc.Spec.RemediationTemplate != nil {
-		if err := addWatches(*nhc.Spec.RemediationTemplate); err != nil {
-			return err
-		}
-	} else {
-		for _, rem := range nhc.Spec.EscalatingRemediations {
-			if err := addWatches(rem.RemediationTemplate); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func (r *NodeHealthCheckReconciler) addRemediationCRWatch(remediationCR *unstructured.Unstructured) error {
-	r.watchesLock.Lock()
-	defer r.watchesLock.Unlock()
-
-	key := remediationCR.GroupVersionKind().String()
-	if _, exists := r.watches[key]; exists {
-		// already watching
-		return nil
-	}
-	if err := r.controller.Watch(
-		source.Kind(r.cache, remediationCR),
-		handler.EnqueueRequestsFromMapFunc(utils.NHCByRemediationCRMapperFunc(r.Log)),
-		predicate.Funcs{
-			// we are just interested in update and delete events for now
-			// remediation CR update: watch conditions
-			// remediation CR deletion: clean up
-			CreateFunc:  func(_ event.CreateEvent) bool { return false },
-			GenericFunc: func(_ event.GenericEvent) bool { return false },
-		},
-	); err != nil {
-		return err
-	}
-	r.watches[key] = struct{}{}
-	r.Log.Info("added watch for remediation CRs", "kind", remediationCR.GetKind())
-	return nil
-}
-
-func (r *NodeHealthCheckReconciler) addRemediationTemplateCRWatch(templateCR *unstructured.Unstructured) error {
-	r.watchesLock.Lock()
-	defer r.watchesLock.Unlock()
-
-	key := templateCR.GroupVersionKind().String()
-	if _, exists := r.watches[key]; exists {
-		// already watching
-		return nil
-	}
-	if err := r.controller.Watch(
-		source.Kind(r.cache, templateCR),
-		handler.EnqueueRequestsFromMapFunc(utils.NHCByRemediationTemplateCRMapperFunc(r.Client, r.Log)),
-		predicate.Funcs{
-			// we are just interested in update and delete events for now
-			// template CR updates: validate
-			// template CR deletion: update NHC status
-			CreateFunc:  func(_ event.CreateEvent) bool { return false },
-			GenericFunc: func(_ event.GenericEvent) bool { return false },
-		},
-	); err != nil {
-		return err
-	}
-	r.watches[key] = struct{}{}
-	r.Log.Info("added watch for remediation template CRs", "kind", templateCR.GetKind())
-	return nil
 }
 
 func (r *NodeHealthCheckReconciler) isNodeRemediationExcluded(node *v1.Node) bool {
